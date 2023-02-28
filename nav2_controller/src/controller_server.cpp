@@ -19,6 +19,7 @@
 #include <utility>
 #include <limits>
 
+#include "lifecycle_msgs/msg/state.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "nav_2d_utils/conversions.hpp"
 #include "nav_2d_utils/tf_help.hpp"
@@ -246,7 +247,19 @@ ControllerServer::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   for (it = controllers_.begin(); it != controllers_.end(); ++it) {
     it->second->deactivate();
   }
-  costmap_ros_->deactivate();
+
+  /*
+   * The costmap is also a lifecycle node, so it may have already fired on_deactivate
+   * via rcl preshutdown cb. Despite the rclcpp docs saying on_shutdown callbacks fire
+   * in the order added, the preshutdown callbacks clearly don't per se, due to using an
+   * unordered_set iteration. Once this issue is resolved, we can maybe make a stronger
+   * ordering assumption: https://github.com/ros2/rclcpp/issues/2096
+   */
+  if (costmap_ros_->get_current_state().id() ==
+    lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
+  {
+    costmap_ros_->deactivate();
+  }
 
   publishZeroVelocity();
   vel_publisher_->on_deactivate();
@@ -271,11 +284,16 @@ ControllerServer::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
   controllers_.clear();
 
   goal_checkers_.clear();
-  costmap_ros_->cleanup();
+  if (costmap_ros_->get_current_state().id() ==
+    lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
+  {
+    costmap_ros_->cleanup();
+  }
 
   // Release any allocated resources
   action_server_.reset();
   odom_sub_.reset();
+  costmap_thread_.reset();
   vel_publisher_.reset();
   speed_limit_sub_.reset();
 
@@ -353,7 +371,7 @@ void ControllerServer::computeControl()
     if (findControllerId(c_name, current_controller)) {
       current_controller_ = current_controller;
     } else {
-      throw nav2_core::ControllerException("Failed to find controller name: " + c_name);
+      throw nav2_core::InvalidController("Failed to find controller name: " + c_name);
     }
 
     std::string gc_name = action_server_->get_current_goal()->goal_checker_id;
@@ -403,6 +421,13 @@ void ControllerServer::computeControl()
           controller_frequency_);
       }
     }
+  } catch (nav2_core::InvalidController & e) {
+    RCLCPP_ERROR(this->get_logger(), "%s", e.what());
+    publishZeroVelocity();
+    std::shared_ptr<Action::Result> result = std::make_shared<Action::Result>();
+    result->error_code = Action::Goal::INVALID_CONTROLLER;
+    action_server_->terminate_current(result);
+    return;
   } catch (nav2_core::ControllerTFError & e) {
     RCLCPP_ERROR(this->get_logger(), "%s", e.what());
     publishZeroVelocity();
@@ -439,6 +464,13 @@ void ControllerServer::computeControl()
     action_server_->terminate_current(result);
     return;
   } catch (nav2_core::ControllerException & e) {
+    RCLCPP_ERROR(this->get_logger(), "%s", e.what());
+    publishZeroVelocity();
+    std::shared_ptr<Action::Result> result = std::make_shared<Action::Result>();
+    result->error_code = Action::Goal::UNKNOWN;
+    action_server_->terminate_current(result);
+    return;
+  } catch (std::exception & e) {
     RCLCPP_ERROR(this->get_logger(), "%s", e.what());
     publishZeroVelocity();
     std::shared_ptr<Action::Result> result = std::make_shared<Action::Result>();
@@ -599,6 +631,12 @@ void ControllerServer::publishZeroVelocity()
   velocity.header.frame_id = costmap_ros_->getBaseFrameID();
   velocity.header.stamp = now();
   publishVelocity(velocity);
+
+  // Reset the state of the controllers after the task has ended
+  ControllerMap::iterator it;
+  for (it = controllers_.begin(); it != controllers_.end(); ++it) {
+    it->second->reset();
+  }
 }
 
 bool ControllerServer::isGoalReached()
